@@ -65,8 +65,9 @@ luci-base          (luci.mk 自动带入)
 rpcd               ubus 对象宿主
 rpcd-mod-ucode     提供 /usr/share/rpcd/ucode 的执行环境
 firewall4          写 wan 区域的 network 列表、提供 masquerade
-ip-tiny            提供 /sbin/ip（busybox 不带 ip applet）
 ```
+
+刻意**不依赖 `ip-tiny` / `ip-full`**：插件只用 `ipcalc.sh`、`uci`、`ubus`，不需要 `ip` 命令。而 `ip-tiny` 与 `ip-full` 是同一源包的两个变体、互相冲突，硬依赖任何一个都会让已经装了另一个变体的镜像在装包阶段报冲突——这类冲突在构建期表现为 image 组装失败，排查起来很绕。
 
 运行期还用到 `ipcalc.sh`（base-files 自带）、`ubus`（netifd 自带）、`ping`（iputils-ping，仅连通性测试用，缺失时只是测试不可用）。**不依赖 curl/wget**：有就用 curl，没有退 wget，都没有就只显示 ping 结果。
 
@@ -145,9 +146,11 @@ logread -e apbridge
 
 ```sh
 ubus call network.interface dump | grep -A3 apb1
-ip -br addr show apb1p
+ubus call network.device status '{"name":"apb1p"}'
 nft list ruleset | grep -A3 'chain srcnat_wan'
 ```
+
+装了 `ip-full` 的话也可以 `ip -br addr show apb1p` 看地址是否真的落到设备上。
 
 ## 已知边界
 
