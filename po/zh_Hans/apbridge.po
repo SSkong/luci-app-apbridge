@@ -1,0 +1,148 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: luci-app-apbridge\n"
+"Language: zh_Hans\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "AP / Modem Access"
+msgstr "AP / 光猫访问"
+
+msgid "Reach an AP on the LAN side, or a modem on the WAN side, that lives in another subnet. The router publishes a spare address inside the target subnet and NATs through the wan firewall zone, so the target device sees traffic from its own subnet and needs no return route."
+msgstr "让 LAN 客户端访问位于其它子网的 AP（LAN 侧）或光猫（WAN 侧）。路由器在目标子网内占用一个空闲地址，并经 wan 防火墙区域做源地址转换，因此目标设备看到的流量来自它自己的网段，不需要它有任何回程路由。"
+
+msgid "General"
+msgstr "常规"
+
+msgid "Enable"
+msgstr "启用"
+
+msgid "When disabled, every object this app created is removed and the network configuration is restored."
+msgstr "关闭时会删除本插件创建的所有对象，并恢复网络配置。"
+
+msgid "Access channels"
+msgstr "访问通道"
+
+msgid "One channel per target device. Addresses must be free, belong to the same subnet as the target, and must not overlap the LAN or any other channel."
+msgstr "每个目标设备一条通道。地址必须空闲、与目标处于同一子网，且不能与 LAN 或其它通道重叠。"
+
+msgid "Name"
+msgstr "名称"
+
+msgid "Location"
+msgstr "位置"
+
+msgid "LAN side — AP behind a LAN port"
+msgstr "LAN 侧 — 接在 LAN 口的 AP"
+
+msgid "WAN side — modem behind the WAN port"
+msgstr "WAN 侧 — 接在 WAN 口的光猫"
+
+msgid "Target address"
+msgstr "目标地址"
+
+msgid "Optional. Management address of the device. Used for the connectivity test and the shortcut link."
+msgstr "可选。设备的管理地址，用于连通性测试与跳转链接。"
+
+msgid "Virtual address"
+msgstr "虚拟地址"
+
+msgid "One free address inside the target subnet, e.g. 192.168.31.254/24. A bare IP is treated as /24."
+msgstr "目标子网内的一个空闲地址，例如 192.168.31.254/24。只填 IP 时按 /24 处理。"
+
+msgid "Active"
+msgstr "启用"
+
+msgid "Runtime status"
+msgstr "运行状态"
+
+msgid "Unable to query runtime status. Check that rpcd is running."
+msgstr "无法获取运行状态，请确认 rpcd 正在运行。"
+
+msgid "The feature is disabled. Enable it above and apply to create the channels."
+msgstr "功能未启用。请在上方启用并应用以创建通道。"
+
+msgid "LAN device \"%s\" is not a bridge. LAN-side channels need a bridge (usually br-lan) to attach the veth pair to."
+msgstr "LAN 设备「%s」不是网桥。LAN 侧通道需要一个网桥（通常是 br-lan）来挂载 veth 对。"
+
+msgid "No WAN device could be detected. WAN-side channels cannot be created."
+msgstr "未检测到 WAN 设备，WAN 侧通道无法创建。"
+
+msgid "Paused"
+msgstr "已暂停"
+
+msgid "Up"
+msgstr "已启用"
+
+msgid "Present, not up"
+msgstr "已创建但未 UP"
+
+msgid "Not created"
+msgstr "未创建"
+
+msgid "none"
+msgstr "无"
+
+msgid "Test"
+msgstr "测试"
+
+msgid "not set"
+msgstr "未填写"
+
+msgid "WAN side"
+msgstr "WAN 侧"
+
+msgid "LAN side"
+msgstr "LAN 侧"
+
+msgid "Channel"
+msgstr "通道"
+
+msgid "Interface"
+msgstr "接口"
+
+msgid "Active addresses"
+msgstr "生效地址"
+
+msgid "Target"
+msgstr "目标"
+
+msgid "Connectivity"
+msgstr "连通性"
+
+msgid "No channels configured yet."
+msgstr "尚未配置任何通道。"
+
+msgid "Re-apply configuration"
+msgstr "重新应用配置"
+
+msgid "testing…"
+msgstr "测试中…"
+
+msgid "probe failed"
+msgstr "探测失败"
+
+msgid "ping ok"
+msgstr "ping 通"
+
+msgid "no ping"
+msgstr "ping 不通"
+
+msgid "HTTP %d"
+msgstr "HTTP %d"
+
+msgid "HTTP ok"
+msgstr "HTTP 可访问"
+
+msgid "no HTTP"
+msgstr "HTTP 不可访问"
+
+msgid "HTTP not tested"
+msgstr "未测试 HTTP"
+
+msgid "Configuration applied."
+msgstr "配置已应用。"
+
+msgid "Apply failed: %s"
+msgstr "应用失败：%s"

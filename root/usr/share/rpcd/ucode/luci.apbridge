@@ -1,0 +1,191 @@
+#!/usr/bin/ucode
+// luci-app-apbridge 后端
+//
+// 只做三件事，真正的配置手术在 /etc/init.d/apbridge 里（shell 处理 uci 更直接）：
+//   status  读取当前生效状态（接口名、netifd 是否 up、实际下发的地址）
+//   probe   对某个目标地址做 ping + HTTP 探测，用于界面上的连通性判断
+//   apply   触发一次重新下发（内部就是 /etc/init.d/apbridge reload）
+//
+// 约定：本文件放在 /usr/share/rpcd/ucode/，rpcd 加载后暴露 ubus 对象 luci.apbridge。
+// 前端每次调用都要在 /usr/share/rpcd/acl.d/luci-app-apbridge.json 里授权。
+
+'use strict';
+
+import { popen, access } from 'fs';
+import { cursor } from 'uci';
+
+const CONF = 'apbridge';
+const IFPFX = 'apb';
+const MAX_CH = 16;
+
+// 执行命令并收集输出。rpcd 本身以 root 运行，权限不是问题，但入参必须自己校验。
+function sh(cmd) {
+	const fd = popen(cmd);
+	let out = '';
+
+	if (fd) {
+		out = fd.read('all');
+		if (out == null)
+			out = '';
+	}
+
+	const rc = fd ? fd.close() : -1;
+
+	return { out: out, rc: rc };
+}
+
+function trim(s) {
+	return replace(s, /^\s+|\s+$/g, '');
+}
+
+function to_array(v) {
+	if (v == null)
+		return [];
+
+	return type(v) == 'array' ? v : [v];
+}
+
+function uci_bool(v) {
+	return v == '1' || v == 'true' || v == 'yes' || v == 'on';
+}
+
+// netifd 的全部接口状态。一次调用拿全量，避免每个通道单独 fork。
+function interface_dump() {
+	const r = sh('ubus call network.interface dump');
+	if (r.rc != 0 || trim(r.out) == '')
+		return {};
+
+	let data = null;
+	try {
+		data = json(r.out);
+	}
+	catch (e) {
+		return {};
+	}
+
+	const map = {};
+	for (const i in (data.interface || []))
+		map[data.interface[i].interface] = data.interface[i];
+
+	return map;
+}
+
+// LAN 侧是否需要 veth，取决于 LAN 设备是不是桥。不是桥时界面要给提示，
+// 否则用户只会看到「通道没生效」却不知道原因。
+function lan_is_bridge(uci) {
+	const dev = uci.get('network', 'lan', 'device') || uci.get('network', 'lan', 'ifname');
+	if (!dev)
+		return { device: '', bridge: false };
+
+	let bridge = false;
+	uci.foreach('network', 'device', function (sec) {
+		if (uci.get('network', sec, 'name') == dev && uci.get('network', sec, 'type') == 'bridge')
+			bridge = true;
+	});
+
+	return { device: dev, bridge: bridge };
+}
+
+const methods = {
+	status: {
+		call: function () {
+			const uci = cursor();
+			const dump = interface_dump();
+			const lan = lan_is_bridge(uci);
+			const want_enabled = uci_bool(uci.get(CONF, 'settings', 'enabled'));
+
+			const result = {
+				enabled: want_enabled,
+				lan_device: lan.device,
+				lan_is_bridge: lan.bridge,
+				wan_device: uci.get('network', 'wan', 'device') || uci.get('network', 'wan', 'ifname') || '',
+				channels: []
+			};
+
+			let idx = 0;
+			uci.foreach(CONF, 'channel', function (sec) {
+				idx++;
+				if (idx > MAX_CH)
+					return false;
+
+				const ifname = IFPFX + idx;
+				const dev = dump[ifname];
+				const active = [];
+
+				if (dev) {
+					for (const a in (dev['ipv4-address'] || []))
+						push(active, dev['ipv4-address'][a].address + '/' + dev['ipv4-address'][a].mask);
+				}
+
+				push(result.channels, {
+					index: idx,
+					section: sec,
+					name: uci.get(CONF, sec, 'name') || ('channel' + idx),
+					side: uci.get(CONF, sec, 'side') || 'lan',
+					enabled: uci_bool(uci.get(CONF, sec, 'enabled') || '1'),
+					target: uci.get(CONF, sec, 'target') || '',
+					ifname: ifname,
+					configured: to_array(uci.get(CONF, sec, 'addr')),
+					active: active,
+					present: dev != null,
+					up: dev != null && dev.up === true
+				});
+
+				return true;
+			});
+
+			uci.unload();
+
+			return result;
+		}
+	},
+
+	probe: {
+		args: { host: 'string' },
+		call: function (request) {
+			const host = trim(request.args.host || '');
+
+			// 只放行 IP 或主机名允许的字符，随后再整体引用，双保险
+			if (!match(host, /^[A-Za-z0-9._-]{1,253}$/))
+				return { ok: false, error: 'invalid host' };
+
+			const quoted = "'" + replace(host, "'", "'\\''") + "'";
+			const res = { ok: true, host: host, ping: false, http: null, http_code: null };
+
+			const p = sh('ping -c 1 -W 2 ' + quoted);
+			res.ping = (p.rc == 0);
+
+			// 管理页面基本都是 HTTP。curl 优先（能拿到状态码），退而用 wget。
+			if (access('/usr/bin/curl', 'x')) {
+				const c = sh("curl -sS -o /dev/null -m 4 -w '%{http_code}' http://" + quoted);
+				const code = trim(c.out);
+				if (code != '' && code != '000') {
+					res.http = true;
+					res.http_code = +code;
+				}
+				else {
+					res.http = false;
+				}
+			}
+			else if (access('/usr/bin/wget', 'x') || access('/bin/wget', 'x')) {
+				const w = sh('wget -q -T 4 -O /dev/null http://' + quoted);
+				res.http = (w.rc == 0);
+			}
+
+			return res;
+		}
+	},
+
+	apply: {
+		call: function () {
+			const r = sh('/etc/init.d/apbridge reload 2>&1');
+			return {
+				ok: (r.rc == 0),
+				code: r.rc,
+				output: trim(r.out)
+			};
+		}
+	}
+};
+
+return { 'luci.apbridge': methods };

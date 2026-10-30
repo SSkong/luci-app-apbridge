@@ -1,0 +1,7 @@
+*           text=auto eol=lf
+*.js        text eol=lf
+*.json      text eol=lf
+*.po        text eol=lf
+*.uci       text eol=lf
+Makefile    text eol=lf
+apbridge    text eol=lf

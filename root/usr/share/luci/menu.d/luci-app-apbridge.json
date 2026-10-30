@@ -1,0 +1,14 @@
+{
+	"admin/network/apbridge": {
+		"title": "AP / Modem Access",
+		"order": 90,
+		"action": {
+			"type": "view",
+			"path": "apbridge"
+		},
+		"depends": {
+			"acl": [ "luci-app-apbridge" ],
+			"uci": { "apbridge": true }
+		}
+	}
+}

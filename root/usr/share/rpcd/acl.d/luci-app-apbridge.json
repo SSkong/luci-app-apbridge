@@ -1,0 +1,17 @@
+{
+	"luci-app-apbridge": {
+		"description": "Grant access to the AP / Modem cross-subnet access app",
+		"read": {
+			"ubus": {
+				"luci.apbridge": [ "status", "probe" ]
+			},
+			"uci": [ "apbridge" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.apbridge": [ "apply" ]
+			},
+			"uci": [ "apbridge" ]
+		}
+	}
+}

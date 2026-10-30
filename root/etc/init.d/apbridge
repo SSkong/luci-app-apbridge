@@ -1,0 +1,329 @@
+#!/bin/sh /etc/rc.common
+# luci-app-apbridge — 让 LAN 客户端访问异子网的 AP / 光猫
+#
+# 工作方式（三层，缺一不可）：
+#   1. 地址层：在目标设备所在子网里占用一个空闲地址。
+#        - side=lan：目标接在 LAN 口，但和 LAN 不同网段。这时不能直接把地址加到
+#          br-lan 上——那样目标网段会被当成 LAN 的一部分，走同区域转发、不做 NAT，
+#          而目标设备通常没有回到 LAN 网段的路由，回包会丢。所以另建一对 veth，
+#          把一端桥进 br-lan（L2 可达），另一端作为独立接口承载地址。
+#        - side=wan：目标在 WAN 侧（典型是 PPPoE 桥接的光猫，WAN 口上没有三层地址）。
+#          直接把静态地址加在 WAN 物理设备上即可，不需要 veth。
+#   2. 区域层：把这些接口加进 wan 防火墙区域的 network 列表，从而获得
+#      forward + masquerade。客户端看到的是虚拟地址，目标设备看到源地址是它自己
+#      网段内的地址，回包不需要额外路由。
+#   3. 应用层：uci 落盘后 reload network，由 netifd 创建 veth / 桥接端口 / 地址。
+#
+# 所有由本脚本写入的 uci 对象都带固定前缀（接口 apb<N>，设备 apbd<N> / apbd<N>p），
+# 每次 apply 先按前缀整体清理再重建，因此重复执行、改配置、关开关都不会留下垃圾。
+
+START=20
+USE_PROCD=1
+
+CONF=apbridge
+IFPFX=apb
+DEVPFX=apbd
+MAX_CH=16
+
+. /lib/functions.sh
+
+log() {
+	local level="$1"; shift
+	logger -t apbridge -p "daemon.$level" "$*"
+}
+
+# parse_addr <ip[/prefix|/netmask]> —— 结果留在 IPADDR / NETWORK / PREFIX / BROADCAST
+# 纯 IP 按 24 位处理（与旧版插件行为一致，避免用户少写掩码就变成 /32）
+parse_addr() {
+	local c="$1" out
+	case "$c" in
+		*/*) ;;
+		*) c="$c/24" ;;
+	esac
+	out="$(ipcalc.sh "$c" 2>/dev/null)" || return 1
+	eval "$out"
+	[ -n "$NETWORK" ] && [ -n "$PREFIX" ] || return 1
+	IPADDR="${c%%/*}"
+	return 0
+}
+
+# overlap <cidrA> <cidrB> —— 两段是否重叠（0=重叠）
+# 用 awk 做纯算术归一化：先取较短前缀，再看两段网络号是否落在同一个块里。
+# 不用 shell 位运算是因为 busybox ash 的整数是有符号 32 位，/8 这类大掩码会溢出。
+overlap() {
+	local a="$1" b="$2"
+	awk -v a="$a" -v b="$b" '
+		function ipnum(s,  o) {
+			split(s, o, ".")
+			return ((o[1] * 256 + o[2]) * 256 + o[3]) * 256 + o[4]
+		}
+		BEGIN {
+			split(a, x, "/"); split(b, y, "/")
+			pa = x[2] + 0; pb = y[2] + 0
+			na = ipnum(x[1]); nb = ipnum(y[1])
+			m = (pa < pb) ? pa : pb
+			blk = 2 ^ (32 - m)
+			exit (int(na / blk) == int(nb / blk)) ? 0 : 1
+		}'
+}
+
+# ---------- 设备发现 ----------
+
+uci_sections_of_type() {
+	local cfg="$1" type="$2"
+	uci -q show "$cfg" 2>/dev/null | sed -n "s/^${cfg}\.\([^.]*\)=${type}\$/\1/p"
+}
+
+# LAN 侧要桥接的目标设备名（通常是 br-lan）
+lan_bridge_name() {
+	local d
+	d="$(uci -q get network.lan.device)"
+	[ -n "$d" ] || d="$(uci -q get network.lan.ifname)"
+	printf '%s' "$d"
+}
+
+# 按 device.name 反查 device 段名
+device_section_by_name() {
+	local want="$1" s
+	[ -n "$want" ] || return 1
+	for s in $(uci_sections_of_type network device); do
+		[ "$(uci -q get "network.$s.name")" = "$want" ] && { printf '%s' "$s"; return 0; }
+	done
+	return 1
+}
+
+wan_device_name() {
+	local d
+	d="$(uci -q get network.wan.device)"
+	[ -n "$d" ] || d="$(uci -q get network.wan.ifname)"
+	printf '%s' "$d"
+}
+
+wan_zone_section() {
+	local z
+	for z in $(uci_sections_of_type firewall zone); do
+		[ "$(uci -q get "firewall.$z.name")" = "wan" ] && { printf '%s' "$z"; return 0; }
+	done
+	return 1
+}
+
+# ---------- 清理 ----------
+
+cleanup_config() {
+	local z s n i
+	local had=0
+
+	# 1) 从所有防火墙区域的 network 列表里摘掉 apb*
+	for z in $(uci_sections_of_type firewall zone); do
+		for n in $(uci -q get "firewall.$z.network"); do
+			case "$n" in
+				${IFPFX}*)
+					uci -q del_list "firewall.$z.network=$n"
+					had=1
+					;;
+			esac
+		done
+	done
+
+	# 2) 从所有桥的 ports 里摘掉 apb*
+	for s in $(uci_sections_of_type network device); do
+		[ "$(uci -q get "network.$s.type")" = "bridge" ] || continue
+		for n in $(uci -q get "network.$s.ports"); do
+			case "$n" in
+				${IFPFX}*)
+					uci -q del_list "network.$s.ports=$n"
+					had=1
+					;;
+			esac
+		done
+	done
+
+	# 3) 删除接口与 veth 设备段
+	i=1
+	while [ "$i" -le "$MAX_CH" ]; do
+		for s in "${IFPFX}${i}" "${DEVPFX}${i}" "${DEVPFX}${i}p"; do
+			if uci -q get "network.$s" >/dev/null 2>&1; then
+				uci -q delete "network.$s"
+				had=1
+			fi
+		done
+		i=$((i + 1))
+	done
+
+	[ "$had" = 1 ] && log info "已清理上一次生成的对象"
+	return 0
+}
+
+# ---------- 生成 ----------
+
+apply_config() {
+	local enabled ldev lsec wdev zsec
+	local black idx sec side name target addrs a b net valid n clash
+	local ifn ok=0
+
+	config_load "$CONF"
+	config_get_bool enabled settings enabled 0
+
+	cleanup_config
+
+	ldev="$(lan_bridge_name)"
+	lsec="$(device_section_by_name "$ldev")"
+	wdev="$(wan_device_name)"
+	zsec="$(wan_zone_section)"
+
+	if [ "$enabled" != "1" ]; then
+		uci -q commit network
+		uci -q commit firewall
+		log info "功能已关闭，配置已恢复"
+		return 0
+	fi
+
+	# 初始黑名单：回环 + LAN 网段。与 LAN 重叠的地址一旦配上，会把本地管理地址
+	# 拽进目标网段，直接失联，所以这里必须拦住。
+	black="127.0.0.0/8"
+	if [ "$(uci -q get network.lan.proto)" = "static" ]; then
+		local lanip
+		lanip="$(uci -q get network.lan.ipaddr)"
+		[ -n "$lanip" ] && parse_addr "$lanip" >/dev/null 2>&1 && black="$black $NETWORK/$PREFIX"
+	fi
+
+	idx=0
+	for sec in $(uci_sections_of_type apbridge channel); do
+		idx=$((idx + 1))
+		[ "$idx" -le "$MAX_CH" ] || break
+
+		config_get_bool cenabled "$sec" enabled 1
+		[ "$cenabled" = 1 ] || continue
+
+		config_get side "$sec" side lan
+		config_get name "$sec" name "channel$idx"
+		config_get addrs "$sec" addr
+		[ -n "$addrs" ] || continue
+
+		# 逐条校验：能解析、非 /32、不与已占用网段重叠
+		valid=""
+		for a in $addrs; do
+			if ! parse_addr "$a"; then
+				log warn "[$name] 地址格式无效，跳过：$a"
+				continue
+			fi
+			if [ "$PREFIX" = "32" ]; then
+				log warn "[$name] /32 无法形成子网，跳过：$a"
+				continue
+			fi
+			if [ -n "$BROADCAST" ] && [ "$IPADDR" = "$BROADCAST" ]; then
+				log warn "[$name] 是广播地址，跳过：$a"
+				continue
+			fi
+			net="$NETWORK/$PREFIX"
+			clash=0
+			for b in $black; do
+				overlap "$net" "$b" && { clash=1; break; }
+			done
+			if [ "$clash" = 1 ]; then
+				log warn "[$name] 与已占用网段重叠，跳过：$a"
+				continue
+			fi
+			valid="$valid $IPADDR/$PREFIX"
+			black="$black $net"
+		done
+
+		[ -n "$valid" ] || continue
+
+		ifn="${IFPFX}${idx}"
+
+		case "$side" in
+			wan)
+				if [ -z "$wdev" ]; then
+					log err "[$name] 取不到 WAN 设备，跳过"
+					continue
+				fi
+				uci -q set "network.$ifn=interface"
+				uci -q set "network.$ifn.proto=static"
+				uci -q set "network.$ifn.device=$wdev"
+				;;
+			*)
+				if [ -z "$lsec" ]; then
+					log err "[$name] LAN 侧目标需要一个桥设备（如 br-lan），当前 LAN 设备 '${ldev}' 不是桥，跳过"
+					continue
+				fi
+				# veth 对：apb<N> 桥进 br-lan，apb<N>p 承载三层地址
+				uci -q set "network.${DEVPFX}${idx}=device"
+				uci -q set "network.${DEVPFX}${idx}.type=veth"
+				uci -q set "network.${DEVPFX}${idx}.name=$ifn"
+				uci -q set "network.${DEVPFX}${idx}.peer_name=${ifn}p"
+
+				uci -q set "network.${DEVPFX}${idx}p=device"
+				uci -q set "network.${DEVPFX}${idx}p.name=${ifn}p"
+
+				uci -q add_list "network.$lsec.ports=$ifn"
+
+				uci -q set "network.$ifn=interface"
+				uci -q set "network.$ifn.proto=static"
+				uci -q set "network.$ifn.device=${ifn}p"
+				;;
+		esac
+
+		for a in $valid; do
+			uci -q add_list "network.$ifn.ipaddr=$a"
+		done
+		# 不能抢默认路由，也不能向上游要 prefix
+		uci -q set "network.$ifn.defaultroute=0"
+		uci -q set "network.$ifn.delegate=0"
+		uci -q set "network.$ifn.auto=1"
+
+		# 区域：放进 wan 区，才有 forward + masquerade
+		if [ -n "$zsec" ]; then
+			n="$(uci -q get "firewall.$zsec.network")"
+			echo "$n" | tr ' ' '\n' | grep -qx "$ifn" || uci -q add_list "firewall.$zsec.network=$ifn"
+		else
+			log warn "找不到名为 wan 的防火墙区域，通道 $ifn 不会被 NAT"
+		fi
+
+		log info "[$name] 通道 $ifn（$side）已下发：$valid"
+		ok=$((ok + 1))
+	done
+
+	uci -q commit network
+	uci -q commit firewall
+
+	[ "$ok" -gt 0 ] || log info "没有可用的访问通道"
+	return 0
+}
+
+service_triggers() {
+	# 这里刻意不监听 network：本脚本自己会 reload network，若再监听 network 会形成
+	# 「network reload → apbridge reload → network reload」的循环。
+	procd_add_reload_trigger "$CONF"
+}
+
+start_service() {
+	apply_config
+	/etc/init.d/network reload
+	return 0
+}
+
+# 开机路径：此时 netifd 还没起来，配置写进去它启动时自然会带起来，不需要 reload。
+# rc_procd true 注册一个空实例，避免 procd 报「service has no instances」。
+boot() {
+	apply_config
+	rc_procd true
+}
+
+# reload 走同一条路径：不 stop（避免先拆干净再建，多一次网络抖动）
+reload_service() {
+	start_service
+}
+
+stop_service() {
+	cleanup_config
+	uci -q commit network
+	uci -q commit firewall
+	/etc/init.d/network reload
+	return 0
+}
+
+# 供 rpcd 与命令行复用
+apply() {
+	start_service
+}
