@@ -8,6 +8,17 @@
 //
 // 约定：本文件放在 /usr/share/rpcd/ucode/，rpcd 加载后暴露 ubus 对象 luci.apbridge。
 // 前端每次调用都要在 /usr/share/rpcd/acl.d/luci-app-apbridge.json 里授权。
+//
+// ── 踩过的坑（务必看）─────────────────────────────────────────────────────
+// uci.foreach(config, type, callback) 的回调参数是**整个 section 字典**，不是
+// section 名。官方示例就是 `section => print(section[".name"])`。
+// 早期版本把它当名字继续传 `uci.get(config, sec, opt)`，而 uci.get 的 C 实现会做
+// 类型校验：
+//     if (ucv_type(conf) != UC_STRING || (sect && ucv_type(sect) != UC_STRING))
+//             err_return(UCI_ERR_INVAL);
+// 于是 status 在遍历到第一个 channel 时就抛异常 → rpcd 回 UBUS_STATUS_UNKNOWN_ERROR
+// → 前端 rpc 拿到 null → 页面显示「无法获取运行状态，请确认 rpcd 正在运行」。
+// 现在统一用 section 字典本身取值（sec.name / sec.addr / sec['.name']）。
 
 'use strict';
 
@@ -38,6 +49,11 @@ function trim(s) {
 	return replace(s, /^\s+|\s+$/g, '');
 }
 
+// 命令行参数整体引用，避免主机名里混进 shell 语法
+function shellquote(s) {
+	return "'" + replace(s, "'", "'\\''") + "'";
+}
+
 function to_array(v) {
 	if (v == null)
 		return [];
@@ -46,7 +62,36 @@ function to_array(v) {
 }
 
 function uci_bool(v) {
+	if (v == null)
+		return false;
+
+	if (v === true)
+		return true;
+
+	if (v === false)
+		return false;
+
 	return v == '1' || v == 'true' || v == 'yes' || v == 'on';
+}
+
+// 从 section 字典取标量选项：list 选项取第一个值，空值回落默认
+function opt(sec, name, def) {
+	let v = sec[name];
+
+	if (type(v) == 'array')
+		v = length(v) ? v[0] : null;
+
+	if (v == null || v == '')
+		return def;
+
+	return v;
+}
+
+function errmsg(e) {
+	if (type(e) == 'object' && e != null && e.message)
+		return '' + e.message;
+
+	return '' + e;
 }
 
 // netifd 的全部接口状态。一次调用拿全量，避免每个通道单独 fork。
@@ -72,67 +117,90 @@ function interface_dump() {
 
 // LAN 侧是否需要 veth，取决于 LAN 设备是不是桥。不是桥时界面要给提示，
 // 否则用户只会看到「通道没生效」却不知道原因。
-function lan_is_bridge(uci) {
-	const dev = uci.get('network', 'lan', 'device') || uci.get('network', 'lan', 'ifname');
-	if (!dev)
-		return { device: '', bridge: false };
-
+function network_state(uci) {
+	const lan = uci.get_all('network', 'lan') || {};
+	const wan = uci.get_all('network', 'wan') || {};
+	const ldev = lan.device || lan.ifname || '';
 	let bridge = false;
-	uci.foreach('network', 'device', function (sec) {
-		if (uci.get('network', sec, 'name') == dev && uci.get('network', sec, 'type') == 'bridge')
-			bridge = true;
-	});
 
-	return { device: dev, bridge: bridge };
+	if (ldev) {
+		uci.foreach('network', 'device', function (dev) {
+			if (dev.name == ldev && dev.type == 'bridge') {
+				bridge = true;
+				return false;   /* 命中即停止遍历 */
+			}
+
+			return true;
+		});
+	}
+
+	return {
+		device: ldev,
+		bridge: bridge,
+		wan_device: wan.device || wan.ifname || ''
+	};
 }
 
 const methods = {
 	status: {
 		call: function () {
 			const uci = cursor();
-			const dump = interface_dump();
-			const lan = lan_is_bridge(uci);
-			const want_enabled = uci_bool(uci.get(CONF, 'settings', 'enabled'));
-
 			const result = {
-				enabled: want_enabled,
-				lan_device: lan.device,
-				lan_is_bridge: lan.bridge,
-				wan_device: uci.get('network', 'wan', 'device') || uci.get('network', 'wan', 'ifname') || '',
+				enabled: false,
+				lan_device: '',
+				lan_is_bridge: false,
+				wan_device: '',
 				channels: []
 			};
 
-			let idx = 0;
-			uci.foreach(CONF, 'channel', function (sec) {
-				idx++;
-				if (idx > MAX_CH)
-					return false;
+			// 任何一处抛异常都不让整个 ubus 调用失败：回一个带 error 字段的字典，
+			// 前端就能把真实原因显示出来，而不是笼统的「无法获取运行状态」。
+			try {
+				const dump = interface_dump();
+				const net = network_state(uci);
+				const settings = uci.get_all(CONF, 'settings') || {};
 
-				const ifname = IFPFX + idx;
-				const dev = dump[ifname];
-				const active = [];
+				result.enabled = uci_bool(settings.enabled);
+				result.lan_device = net.device;
+				result.lan_is_bridge = net.bridge;
+				result.wan_device = net.wan_device;
 
-				if (dev) {
-					for (const a in (dev['ipv4-address'] || []))
-						push(active, dev['ipv4-address'][a].address + '/' + dev['ipv4-address'][a].mask);
-				}
+				let idx = 0;
 
-				push(result.channels, {
-					index: idx,
-					section: sec,
-					name: uci.get(CONF, sec, 'name') || ('channel' + idx),
-					side: uci.get(CONF, sec, 'side') || 'lan',
-					enabled: uci_bool(uci.get(CONF, sec, 'enabled') || '1'),
-					target: uci.get(CONF, sec, 'target') || '',
-					ifname: ifname,
-					configured: to_array(uci.get(CONF, sec, 'addr')),
-					active: active,
-					present: dev != null,
-					up: dev != null && dev.up === true
+				uci.foreach(CONF, 'channel', function (sec) {
+					idx++;
+					if (idx > MAX_CH)
+						return false;
+
+					const ifname = IFPFX + idx;
+					const dev = dump[ifname];
+					const active = [];
+
+					if (dev) {
+						for (const a in (dev['ipv4-address'] || []))
+							push(active, dev['ipv4-address'][a].address + '/' + dev['ipv4-address'][a].mask);
+					}
+
+					push(result.channels, {
+						index: idx,
+						section: sec['.name'],
+						name: opt(sec, 'name', 'channel' + idx),
+						side: opt(sec, 'side', 'lan'),
+						enabled: (sec.enabled == null) ? true : uci_bool(sec.enabled),
+						target: opt(sec, 'target', ''),
+						ifname: ifname,
+						configured: to_array(sec.addr),
+						active: active,
+						present: dev != null,
+						up: dev != null && dev.up === true
+					});
+
+					return true;
 				});
-
-				return true;
-			});
+			}
+			catch (e) {
+				result.error = errmsg(e);
+			}
 
 			uci.unload();
 
@@ -149,27 +217,33 @@ const methods = {
 			if (!match(host, /^[A-Za-z0-9._-]{1,253}$/))
 				return { ok: false, error: 'invalid host' };
 
-			const quoted = "'" + replace(host, "'", "'\\''") + "'";
 			const res = { ok: true, host: host, ping: false, http: null, http_code: null };
 
-			const p = sh('ping -c 1 -W 2 ' + quoted);
-			res.ping = (p.rc == 0);
+			try {
+				const p = sh('ping -c 1 -W 2 ' + shellquote(host));
+				res.ping = (p.rc == 0);
 
-			// 管理页面基本都是 HTTP。curl 优先（能拿到状态码），退而用 wget。
-			if (access('/usr/bin/curl', 'x')) {
-				const c = sh("curl -sS -o /dev/null -m 4 -w '%{http_code}' http://" + quoted);
-				const code = trim(c.out);
-				if (code != '' && code != '000') {
-					res.http = true;
-					res.http_code = +code;
+				// 管理页面基本都是 HTTP。curl 优先（能拿到状态码），退而用 wget。
+				if (access('/usr/bin/curl')) {
+					const c = sh('curl -sS -o /dev/null -m 4 -w "%{http_code}" http://' + shellquote(host));
+					const code = trim(c.out);
+
+					if (code != '' && code != '000') {
+						res.http = true;
+						res.http_code = +code;
+					}
+					else {
+						res.http = false;
+					}
 				}
-				else {
-					res.http = false;
+				else if (access('/usr/bin/wget') || access('/bin/wget')) {
+					const w = sh('wget -q -T 4 -O /dev/null http://' + shellquote(host));
+					res.http = (w.rc == 0);
 				}
 			}
-			else if (access('/usr/bin/wget', 'x') || access('/bin/wget', 'x')) {
-				const w = sh('wget -q -T 4 -O /dev/null http://' + quoted);
-				res.http = (w.rc == 0);
+			catch (e) {
+				res.ok = false;
+				res.error = errmsg(e);
 			}
 
 			return res;
@@ -178,12 +252,17 @@ const methods = {
 
 	apply: {
 		call: function () {
-			const r = sh('/etc/init.d/apbridge reload 2>&1');
-			return {
-				ok: (r.rc == 0),
-				code: r.rc,
-				output: trim(r.out)
-			};
+			try {
+				const r = sh('/etc/init.d/apbridge reload 2>&1');
+				return {
+					ok: (r.rc == 0),
+					code: r.rc,
+					output: trim(r.out)
+				};
+			}
+			catch (e) {
+				return { ok: false, code: -1, output: errmsg(e) };
+			}
 		}
 	}
 };

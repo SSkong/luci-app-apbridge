@@ -146,3 +146,9 @@ msgstr "配置已应用。"
 
 msgid "Apply failed: %s"
 msgstr "应用失败：%s"
+
+msgid "Failed to query runtime status: %s"
+msgstr "运行状态查询失败：%s"
+
+msgid "On the device, run \"ubus -v list luci.apbridge\" and \"logread | grep rpcd\" to see the underlying reason."
+msgstr "可在设备上执行 \"ubus -v list luci.apbridge\" 和 \"logread | grep rpcd\" 查看具体原因。"

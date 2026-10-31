@@ -14,10 +14,23 @@
  * 所有会改动网络的逻辑都在后端（init.d + rpcd ucode），这里只做展示与触发。
  */
 
+// reject: true 时非零 ubus 状态码会 reject，err.message 里带着「哪个对象/方法、
+// ubus code 几、什么原因」。之前没有它，失败只会得到 null，前端只能显示一句
+// 笼统的「无法获取运行状态」，排查时等于什么都没有。
 var callStatus = rpc.declare({
 	object: 'luci.apbridge',
-	method: 'status'
+	method: 'status',
+	reject: true
 });
+
+function queryStatus() {
+	return callStatus().catch(function(err) {
+		return {
+			error: (err && err.message) ? err.message : String(err),
+			channels: []
+		};
+	});
+}
 
 var callProbe = rpc.declare({
 	object: 'luci.apbridge',
@@ -47,7 +60,7 @@ return view.extend({
 	load: function() {
 		return Promise.all([
 			uci.load('apbridge'),
-			L.resolveDefault(callStatus(), null)
+			L.resolveDefault(queryStatus(), null)
 		]);
 	},
 
@@ -110,7 +123,7 @@ return view.extend({
 	},
 
 	pollStatus: function() {
-		return L.resolveDefault(callStatus(), null).then(L.bind(function(status) {
+		return L.resolveDefault(queryStatus(), null).then(L.bind(function(status) {
 			var el = document.getElementById('apbridge-status');
 			if (!el || !status)
 				return;
@@ -131,6 +144,15 @@ return view.extend({
 
 		var rows = [];
 		var notices = [];
+
+		// 后端自己 catch 住异常时会带回 error 字段。把它原文显示出来，比一句
+		// 「无法获取运行状态」有用得多 —— 能直接看出是对象没注册、权限不足，
+		// 还是某个 uci 调用抛了异常。
+		if (status.error)
+			notices.push(E('div', { 'class': 'alert-message danger' }, [
+				E('p', {}, _('Failed to query runtime status: %s').format(status.error)),
+				E('p', {}, _('On the device, run "ubus -v list luci.apbridge" and "logread | grep rpcd" to see the underlying reason.'))
+			]));
 
 		if (!status.enabled)
 			notices.push(E('div', { 'class': 'alert-message warning' },
@@ -225,6 +247,33 @@ return view.extend({
 			table,
 			E('div', { style: 'margin-top:1em' }, applyBtn)
 		]);
+	},
+
+	// 保存后显式跑一次 apbridge reload。
+	//
+	// LuCI 的标准链路是 handleSave → ui.changes.apply → /sbin/reload_config →
+	// procd 的 config.change 事件 → 本插件 init.d 里的 reload trigger。这条链上任
+	// 一环出问题（比如服务没在 procd 注册实例、trigger 没生效），表现都是「点了
+	// 启用，什么都没发生」，而且没有任何反馈。
+	// 这里保存完直接调一次后端的 apply（幂等：脚本每次先按 apb* 前缀清干净再重建），
+	// 成功失败都弹通知，不再让人靠猜。
+	handleSaveApply: function(ev, mode) {
+		return this.handleSave(ev)
+			.then(function() {
+				return uci.apply();
+			})
+			.then(function() {
+				return L.resolveDefault(callApply(), { ok: false, output: 'rpc failed' });
+			})
+			.then(L.bind(function(res) {
+				if (res && res.ok)
+					ui.addNotification(null, E('p', {}, _('Configuration applied.')), 'info');
+				else
+					ui.addNotification(null, E('p', {},
+						_('Apply failed: %s').format((res && res.output) || '?')), 'danger');
+
+				return this.pollStatus();
+			}, this));
 	},
 
 	doProbe: function(ch) {
