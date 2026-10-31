@@ -10,6 +10,29 @@
 // 前端每次调用都要在 /usr/share/rpcd/acl.d/luci-app-apbridge.json 里授权。
 //
 // ── 踩过的坑（务必看）─────────────────────────────────────────────────────
+//
+// 【坑 1】ucode 不支持 `for (const x in arr)`，也不支持 `for (x of arr)`。
+// 这两种写法是 **编译期 Syntax error**，而 rpcd 加载脚本失败时**完全静默**
+// （不写 syslog、不报错），表现是 /usr/share/rpcd/ucode/ 里文件明明在、
+// ubus 对象却压根不存在：
+//     # ubus -v list luci.apbridge
+//     Command failed: Not found
+// 前端拿不到对象，rpc 返回 null，页面就显示「无法获取运行状态，请确认 rpcd
+// 正在运行」—— 排查时极易误判成 rpcd 没跑或 ACL 没配。
+// 正确写法只有两种：
+//     for (let i = 0; i < length(arr); i++)   /* C 风格，i 是索引 */
+//     for (v in arr)                          /* 拿到的是元素本身，不是索引！ */
+// 注意后者与 JS 语义相反：ucode 里 `for (v in [7,8])` 中 v 依次是 7、8，
+// `arr[v]` 是 null。对象则是取 key（`for (k in obj)` → obj[k] 有效）。
+//
+// 【坑 2】ucode 没有 `throw` 语句（写 `throw "x"` 报 Syntax error），抛错用
+// `die(msg)`，一样能被 try/catch 接住；catch 到的 e 是**字符串**而非 Error 对象，
+// 取错误文本直接用 `'' + e`，没有 e.message。本文件的 errmsg() 两种都兼容。
+//
+// 改完 .uc 文件务必在**设备上**跑一次语法检查，这是唯一可靠的验证：
+//     ucode -c /usr/share/rpcd/ucode/luci.apbridge
+//
+// ── 历史问题（已修）─────────────────────────────────────────────────────
 // uci.foreach(config, type, callback) 的回调参数是**整个 section 字典**，不是
 // section 名。官方示例就是 `section => print(section[".name"])`。
 // 早期版本把它当名字继续传 `uci.get(config, sec, opt)`，而 uci.get 的 C 实现会做
@@ -108,9 +131,15 @@ function interface_dump() {
 		return {};
 	}
 
+	const list = data.interface || [];
 	const map = {};
-	for (const i in (data.interface || []))
-		map[data.interface[i].interface] = data.interface[i];
+
+	// 注意：ucode 不支持 `for (const x in arr)`（编译期就报 Syntax error，
+	// 整个脚本加载失败 → rpcd 静默跳过 → ubus 对象压根不存在）。
+	// 而且 ucode 里 `for (x in arr)` 拿到的**是元素本身**，不是索引，与 JS 不同。
+	// 需要索引就用 C 风格循环。
+	for (let i = 0; i < length(list); i++)
+		map[list[i].interface] = list[i];
 
 	return map;
 }
@@ -177,8 +206,10 @@ const methods = {
 					const active = [];
 
 					if (dev) {
-						for (const a in (dev['ipv4-address'] || []))
-							push(active, dev['ipv4-address'][a].address + '/' + dev['ipv4-address'][a].mask);
+						const addrs = dev['ipv4-address'] || [];
+
+						for (let j = 0; j < length(addrs); j++)
+							push(active, addrs[j].address + '/' + addrs[j].mask);
 					}
 
 					push(result.channels, {
